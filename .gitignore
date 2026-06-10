@@ -1,0 +1,30 @@
+# 缓存（自动生成，不必提交）
+cache/
+
+# 训练图片（太大 + 个人数据）
+images/
+
+# 生成的报告
+report/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+.virtual_documents/
+*.ipynb
+
+# IDE / 系统
+.claude/
+.idea/
+.vscode/
+anaconda_projects/
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
