@@ -23,7 +23,7 @@ from sklearn.metrics import (confusion_matrix, accuracy_score, f1_score,
                               silhouette_score)
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.neighbors import NearestNeighbors
 from scipy.cluster.hierarchy import dendrogram, linkage
@@ -43,6 +43,8 @@ sns.set_style("whitegrid")
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Noto Sans SC', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 # 强制 matplotlib 重新扫描字体
+import matplotlib.font_manager as fm
+fm._load_fontmanager(try_read_cache=False)
 
 REPORT_DIR = os.path.join(BASE_DIR, "report")
 os.makedirs(REPORT_DIR, exist_ok=True)
@@ -151,10 +153,9 @@ p()
 print("[3/7] 特征提取...")
 t0 = time.time()
 X, y_raw, label_names = load_or_build_features(face_images, labels_list, cascade, yunet)
-# 使用 label_names 自身顺序编码 (与 face_gui.py 一致, 避免 Unicode 重排序)
-label_names = list(label_names)
-y = np.array([label_names.index(lb) for lb in y_raw])
-n_classes = len(label_names)
+# 使用 LabelEncoder 保证编码与测试参考一致
+le = LabelEncoder(); y = le.fit_transform(y_raw)
+label_names = le.classes_; n_classes = len(label_names)
 p(f"**特征维度**: {X.shape[1]} 维 (dlib ResNet)")
 p(f"**样本总数**: {X.shape[0]} (含数据增强)")
 p()
@@ -202,8 +203,6 @@ p()
 
 # --- 分类 ---
 print("[5/7] 分类模型训练与评估...")
-scaler = StandardScaler().fit(X)  # 统一 scaler, SVM 和聚类共用
-
 X_tr, X_te, y_tr, y_te = train_test_split(
     X, y, test_size=0.2, random_state=RANDOM_SEED, stratify=y)
 
@@ -266,7 +265,8 @@ results.append(('决策树', dt_acc, dt_f1))
 # SVM
 p("### 3.3 SVM 分类器")
 p()
-X_tr_s = scaler.transform(X_tr); X_te_s = scaler.transform(X_te)
+scaler = StandardScaler()
+X_tr_s = scaler.fit_transform(X_tr); X_te_s = scaler.transform(X_te)
 svm = SVC(kernel='rbf', C=10, gamma='scale', random_state=RANDOM_SEED)
 svm.fit(X_tr_s, y_tr)
 svm_pred = svm.predict(X_te_s)
@@ -313,7 +313,7 @@ save_and_embed(fig, '07_classifier_compare.png', '图7: 分类器性能对比')
 
 # --- 聚类 ---
 print("[6/7] 聚类分析...")
-X_scaled = scaler.transform(X)
+X_scaled = StandardScaler().fit_transform(X)
 
 # KMeans
 p("### 4.1 KMeans 聚类")

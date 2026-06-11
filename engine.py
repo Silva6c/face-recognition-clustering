@@ -38,10 +38,7 @@ YUNET_CONF_THRESHOLD = 0.6
 # 图片读取
 # ============================================================
 def imread_safe(path):
-    """兼容中文路径 — 非 ASCII 路径直接走 imdecode, 避免 cv2.imread 必定失败"""
-    if any(ord(c) > 127 for c in path):
-        with open(path, 'rb') as f:
-            return cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
+    """兼容中文路径"""
     img = cv2.imread(path)
     if img is not None:
         return img
@@ -139,27 +136,22 @@ class CosineClassifier:
         self.prototypes = {}
         self.classes_ = None
 
-    @staticmethod
-    def _norm(x):
-        """L2 归一化 (共享方法, 避免 predict_scores 和 _sims 重复实现)"""
-        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
-
     def fit(self, X, y):
         self.classes_ = np.unique(y)
         for lb in self.classes_:
             proto = X[y == lb].mean(axis=0)
-            proto = self._norm(proto)  # L2 归一化
+            proto /= (np.linalg.norm(proto) + 1e-8)
             self.prototypes[lb] = proto
         return self
 
     def _sims(self, X):
         """归一化 + 计算与所有原型的余弦相似度"""
-        x_norm = self._norm(X)
+        x_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
         return np.column_stack([np.dot(x_norm, self.prototypes[lb])
                                 for lb in self.classes_])
 
     def predict_scores(self, x):
-        x_norm = self._norm(np.atleast_2d(x))[0]
+        x_norm = x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
         return {lb: float(np.dot(x_norm, self.prototypes[lb]))
                 for lb in self.classes_}
 
@@ -196,8 +188,8 @@ def load_or_build_features(face_images, labels_list, cascade, yunet):
             print(f"    {len(features)} faces...")
 
     # 数据增强
-    from collections import Counter
-    label_counts = Counter(valid_labels)
+    label_counts = {}
+    for lb in valid_labels: label_counts[lb] = label_counts.get(lb, 0) + 1
     small_set = {lb for lb, c in label_counts.items() if c <= SMALL_THRESHOLD}
 
     aug_f, aug_l = [], []

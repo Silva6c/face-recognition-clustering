@@ -16,8 +16,9 @@ from PIL import Image, ImageDraw, ImageFont
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, normalized_mutual_info_score
+from collections import Counter
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 from scipy.cluster.hierarchy import dendrogram, linkage
@@ -120,11 +121,13 @@ def render_top3(model_choice):
         return None
 
     sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    # 若 _last_final_idx 无效(初始-1), 高亮最高分项
+    highlight_idx = _last_final_idx if _last_final_idx >= 0 else sorted_scores[0][0]
     fig, ax = plt.subplots(figsize=(5, 2.5))
     names_top3 = [label_names[i].split()[-1] if ' ' in label_names[i]
                   else label_names[i] for i, _ in sorted_scores]
     vals_top3 = [max(s, 0) for _, s in sorted_scores]
-    colors_bar = ['#2ecc71' if i == _last_final_idx else '#bdc3c7' for i, _ in sorted_scores]
+    colors_bar = ['#2ecc71' if i == highlight_idx else '#bdc3c7' for i, _ in sorted_scores]
     ax.barh(names_top3[::-1], vals_top3[::-1], color=colors_bar[::-1])
     ax.set_xlim(0, 1)
     ax.set_title(f'{title_map.get(model_choice, "")} Top-3')
@@ -134,9 +137,16 @@ def render_top3(model_choice):
 
 
 def _draw_label_pil(img_bgr, text, x, y, box_color_bgr):
-    """使用 PIL 绘制带中文支持的标签 (cv2.putText 的 Hershey 字体仅支持 ASCII)"""
+    """使用 PIL 绘制带中文支持的标签 (cv2.putText 的 Hershey 字体仅支持 ASCII)
+
+    若无中文字体, 自动回退到 cv2.putText (仅 ASCII 文本可正常显示)"""
     if _FONT_PATH is None:
-        return img_bgr  # 没找到中文字体, 不崩溃
+        # 回退: 使用 cv2 绘制标签 (仅支持 ASCII 字符)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.rectangle(img_bgr, (x, y - th - 10), (x + tw, y), box_color_bgr, -1)
+        cv2.putText(img_bgr, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 0), 2)
+        return img_bgr
 
     img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
@@ -198,7 +208,7 @@ def initialize():
         X_all, y_raw, label_names = load_or_build_features(
             face_images, labels_list, face_cascade, yunet_detector)
 
-    y_all = np.array([list(label_names).index(name) for name in y_raw])
+    le = LabelEncoder(); y_all = le.fit_transform(y_raw)
 
     print(f"  样本: {X_all.shape}, 类别: {len(label_names)}")
     for i, name in enumerate(label_names):
@@ -259,11 +269,7 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
     feat_2d = feat.reshape(1, -1)
     cos_scores = cosine_clf.predict_scores(feat)
     cos_best = max(cos_scores, key=cos_scores.get)
-    # 从已有的 cos_scores 派生 proba, 避免 predict_proba 重复归一化+点积
-    lbs = sorted(cos_scores.keys())
-    arr = np.array([max(cos_scores[lb], 0) for lb in lbs])
-    exp = np.exp((arr - arr.max()) * 10)
-    cos_probs = exp / exp.sum()
+    cos_probs = cosine_clf.predict_proba(feat_2d)[0]
 
     knn_pred = knn_clf.predict(feat_2d)[0]
     knn_probs = knn_clf.predict_proba(feat_2d)[0]
@@ -280,10 +286,10 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
     else:                 # 模糊: 全局余弦度量更鲁棒
         w_cos, w_knn, w_svm = 0.55, 0.25, 0.20
 
-    weighted = {}
+    weighted = Counter()
     for pred, w in [(cos_best, w_cos), (knn_pred, w_knn), (svm_pred, w_svm)]:
-        weighted[pred] = weighted.get(pred, 0) + w
-    final = max(weighted, key=weighted.get)
+        weighted[pred] += w
+    final = weighted.most_common(1)[0][0]
     final_name = label_names[final]
 
     cos_conf = max(cos_scores.get(final, 0), 0)
@@ -293,7 +299,8 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
     # 共识度: 三模型置信度标准差越小越可信
     consensus = 1.0 - float(np.std([cos_conf, knn_conf, svm_conf]))
 
-    agree = (cos_best == final) + (knn_pred == final) + (svm_pred == final)
+    vote = Counter([cos_best, knn_pred, svm_pred])
+    agree = vote[final]
 
     # 开集拒识
     if avg_conf < 0.55:
@@ -342,7 +349,21 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
     _last_svm_scores = {i: float(svm_probs[i]) for i in range(len(svm_probs))}
     _last_final_idx = final
 
-    chart = render_top3(top3_model)
+    # Top-3 图 (根据 top3_model 选择数据源)
+    title_map = {"余弦匹配": "余弦相似度", "KNN(k=3)": "KNN 置信度", "SVM(RBF)": "SVM 置信度"}
+    scores_map = {"余弦匹配": _last_cos_scores, "KNN(k=3)": _last_knn_scores, "SVM(RBF)": _last_svm_scores}
+    chart_scores = scores_map.get(top3_model, _last_cos_scores)
+    sorted_scores = sorted(chart_scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    fig, ax = plt.subplots(figsize=(5, 2.5))
+    names_top3 = [label_names[i].split()[-1] if ' ' in label_names[i]
+                  else label_names[i] for i, _ in sorted_scores]
+    vals_top3 = [max(s, 0) for _, s in sorted_scores]
+    colors_bar = ['#2ecc71' if i == final else '#bdc3c7' for i, _ in sorted_scores]
+    ax.barh(names_top3[::-1], vals_top3[::-1], color=colors_bar[::-1])
+    ax.set_xlim(0, 1); ax.set_title(f'{title_map.get(top3_model, "")} Top-3')
+    for i, v in enumerate(vals_top3):
+        ax.text(v + 0.02, 2-i, f'{v:.1%}', va='center')
+    chart = fig_to_pil(fig)
 
     return result_rgb, final_name, agree, avg_conf, detail, chart
 
@@ -379,14 +400,6 @@ def set_webcam_top3(choice):
 # ============================================================
 # 在线录入回调
 # ============================================================
-def _build_gallery():
-    """构建当前缓冲区的 Gallery 列表"""
-    return [_annotate_for_gallery(img) for img in _enroll_buffer]
-
-def _enroll_count_str():
-    """已采集计数 Markdown"""
-    return f"已采集: **{len(_enroll_buffer)}** / 20 张"
-
 def _annotate_for_gallery(img_bgr):
     """给采集的照片画人脸框 (用于 Gallery 展示)"""
     rect = detect_face(img_bgr, fast_mode=True)
@@ -401,22 +414,22 @@ def capture_face(webcam_img):
     """从摄像头采集一张人脸照片, 采集后自动清除输入框"""
     global _enroll_buffer
     if webcam_img is None:
-        gallery = _build_gallery()
-        return gallery, _enroll_count_str(), "⚠️ 摄像头未开启", None
+        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 摄像头未开启", None
 
     img_bgr = cv2.cvtColor(np.array(webcam_img), cv2.COLOR_RGB2BGR)
     rect = detect_face(img_bgr)
     if rect is None:
-        gallery = _build_gallery()
-        return gallery, _enroll_count_str(), "⚠️ 未检测到人脸，请正对摄像头", None
+        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 未检测到人脸，请正对摄像头", None
 
     if len(_enroll_buffer) >= 20:
-        gallery = _build_gallery()
-        return gallery, _enroll_count_str(), "⚠️ 已达最大采集数量 (20张)", None
+        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 已达最大采集数量 (20张)", None
 
     _enroll_buffer.append(img_bgr)
-    gallery = _build_gallery()
-    return gallery, _enroll_count_str(), f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
+    gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+    return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
 
 
 def clear_enroll():
@@ -430,8 +443,8 @@ def batch_import_files(files):
     """批量导入文件: 自动检测人脸 → 入缓冲区, 选完即处理"""
     global _enroll_buffer
     if files is None or len(files) == 0:
-        gallery = _build_gallery()
-        return (gallery, _enroll_count_str(),
+        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+        return (gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张",
                 "⚠️ 未选择任何文件", None)
 
     total = len(files)
@@ -453,7 +466,7 @@ def batch_import_files(files):
         _enroll_buffer.append(img_bgr)
         added += 1
 
-    gallery = _build_gallery()
+    gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
     parts = []
     if added > 0:
         parts.append(f"✅ 已添加 **{added}** 张人脸")
@@ -463,7 +476,7 @@ def batch_import_files(files):
         parts.append(f"⏭️ {skipped_full} 张因缓冲区已满跳过")
     status = f"📁 从 {total} 个文件中: " + (", ".join(parts) if parts else "无有效图片")
 
-    return (gallery, _enroll_count_str(), status, None)
+    return (gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", status, None)
 
 
 def do_enroll(name):
