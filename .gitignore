@@ -25,6 +25,9 @@ anaconda_projects/
 .DS_Store
 Thumbs.db
 
+# 版本打包（仅本地）
+版本/
+
 # 临时文件
 *.tmp
 *.bak
