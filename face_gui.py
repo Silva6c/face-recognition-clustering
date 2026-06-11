@@ -421,24 +421,28 @@ def _annotate_for_gallery(img_bgr):
 
 
 def capture_face(webcam_img):
-    """从摄像头采集一张人脸照片, 采集后自动清除输入框"""
+    """从摄像头采集一张人脸照片"""
     global _enroll_buffer
     if webcam_img is None:
         gallery = _build_gallery()
-        return gallery, _enroll_status(), "⚠️ 摄像头未开启", None
+        gr.Warning("摄像头未开启")
+        return gallery, _enroll_status(), "⚠️ 摄像头未开启", gr.skip()
 
     img_bgr = cv2.cvtColor(np.array(webcam_img), cv2.COLOR_RGB2BGR)
     rect = detect_face(img_bgr)
     if rect is None:
         gallery = _build_gallery()
-        return gallery, _enroll_status(), "⚠️ 未检测到人脸，请正对摄像头", None
+        gr.Warning("未检测到人脸，请正对摄像头")
+        return gallery, _enroll_status(), "⚠️ 未检测到人脸，请正对摄像头", gr.skip()
 
     if len(_enroll_buffer) >= 20:
         gallery = _build_gallery()
-        return gallery, _enroll_status(), "⚠️ 已达最大采集数量 (20张)", None
+        gr.Warning("已达最大采集数量 20 张")
+        return gallery, _enroll_status(), "⚠️ 已达最大采集数量 (20张)", gr.skip()
 
     _enroll_buffer.append(img_bgr)
     gallery = _build_gallery()
+    gr.Info(f"第 {len(_enroll_buffer)} 张采集成功")
     return gallery, _enroll_status(), f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
 
 
@@ -446,6 +450,7 @@ def clear_enroll():
     """清空采集缓冲区 + 所有输入组件"""
     global _enroll_buffer
     _enroll_buffer = []
+    gr.Info("已清空采集缓冲区")
     return [], "已采集: **0** / 20 张", "🔄 已清空，请重新采集", None, None
 
 
@@ -454,6 +459,7 @@ def batch_import_files(files):
     global _enroll_buffer
     if files is None or len(files) == 0:
         gallery = _build_gallery()
+        gr.Warning("未选择任何文件")
         return (gallery, _enroll_status(),
                 "⚠️ 未选择任何文件", None)
 
@@ -486,6 +492,14 @@ def batch_import_files(files):
         parts.append(f"⏭️ {skipped_full} 张因缓冲区已满跳过")
     status = f"📁 从 {total} 个文件中: " + (", ".join(parts) if parts else "无有效图片")
 
+    # Toast 强提醒
+    if added > 0 and skipped_no_face == 0 and skipped_full == 0:
+        gr.Info(f"已添加 {added} 张人脸")
+    elif added > 0:
+        gr.Warning(f"已添加 {added} 张，{skipped_no_face + skipped_full} 张跳过")
+    else:
+        gr.Warning("未能添加任何有效人脸")
+
     return (gallery, _enroll_status(), status, None)
 
 
@@ -494,9 +508,13 @@ def do_enroll(name):
     global _enroll_buffer
 
     if not name or not name.strip():
-        return "⚠️ 请先输入姓名", None, None, gr.skip()
+        gallery = _build_gallery()
+        gr.Warning("请先输入姓名")
+        return "⚠️ 请先输入姓名", gallery, _enroll_status(), gr.skip()
     if len(_enroll_buffer) < 3:
-        return f"⚠️ 至少需要采集 **3** 张照片（当前 {len(_enroll_buffer)} 张）", None, None, gr.skip()
+        gallery = _build_gallery()
+        gr.Warning(f"至少需要 3 张照片（当前 {len(_enroll_buffer)} 张）")
+        return f"⚠️ 至少需要采集 **3** 张照片（当前 {len(_enroll_buffer)} 张）", gallery, _enroll_status(), gr.skip()
 
     name = name.strip()
     images_bgr = list(_enroll_buffer)
@@ -507,7 +525,9 @@ def do_enroll(name):
     # 2. 提取特征 + 增强
     new_X, result = enroll_new_face(name, images_bgr, face_cascade, yunet_detector)
     if new_X is None:
-        return f"❌ 录入失败: {result}", None, None, gr.skip()
+        gallery = _build_gallery()
+        gr.Error(f"录入失败: {result}")
+        return f"❌ 录入失败: {result}", gallery, _enroll_status(), gr.skip()
 
     # 3. 更新缓存
     update_cache_incremental(new_X, result)
@@ -519,6 +539,7 @@ def do_enroll(name):
     n_raw = len(images_bgr)
     _enroll_buffer = []
 
+    gr.Info(f"✅ {name} 录入成功！")
     return (
         f"## ✅ 录入成功！\n\n"
         f"| 项目 | 数据 |\n"
@@ -751,7 +772,8 @@ def build_ui():
                 with gr.Row(equal_height=True):
                     with gr.Column(scale=2):
                         enroll_cam = gr.Image(label="📸 摄像头采集", type="numpy",
-                                              sources=["webcam"], height=300)
+                                              sources=["webcam"], streaming=True,
+                                              height=300)
                         with gr.Row():
                             btn_capture = gr.Button("📸 采集一张", variant="primary")
                             btn_clear_enroll = gr.Button("🔄 清空重来")
@@ -778,7 +800,7 @@ def build_ui():
 
                 enroll_status = gr.Markdown("等待采集...")
 
-                # 单张采集 (摄像头/上传/粘贴) → 入缓冲区 → 自动清空输入
+                # 单张采集 — streaming=True 保持摄像头流
                 btn_capture.click(
                     fn=capture_face, inputs=[enroll_cam],
                     outputs=[enroll_gallery, enroll_count, enroll_status, enroll_cam])
