@@ -61,6 +61,10 @@ X_tsne = None      # 延迟计算
 km_labels = None
 _tsne_ready = False
 
+# 模块级常量
+_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+_MODEL_CHOICES = ["余弦匹配", "KNN(k=3)", "SVM(RBF)"]
+
 _enroll_buffer = []  # 录入采集缓冲区: list of BGR numpy arrays
 
 # 最近一次识别的三模型分数 (用于 Top-3 图表切换)
@@ -197,7 +201,7 @@ def initialize():
             d = os.path.join(IMAGES_DIR, cls)
             if not os.path.isdir(d): continue
             for fn in sorted(os.listdir(d)):
-                if not fn.lower().endswith(('.jpg','.jpeg','.png','.bmp','.webp')): continue
+                if not fn.lower().endswith(_IMAGE_EXTENSIONS): continue
                 img = imread_safe(os.path.join(d, fn))
                 if img is None: continue
                 rect = detect_face(img, fast_mode=False)
@@ -400,6 +404,12 @@ def set_webcam_top3(choice):
 # ============================================================
 # 在线录入回调
 # ============================================================
+def _build_gallery():
+    return [_annotate_for_gallery(img) for img in _enroll_buffer]
+
+def _enroll_status():
+    return f"已采集: **{len(_enroll_buffer)}** / 20 张"
+
 def _annotate_for_gallery(img_bgr):
     """给采集的照片画人脸框 (用于 Gallery 展示)"""
     rect = detect_face(img_bgr, fast_mode=True)
@@ -414,22 +424,22 @@ def capture_face(webcam_img):
     """从摄像头采集一张人脸照片, 采集后自动清除输入框"""
     global _enroll_buffer
     if webcam_img is None:
-        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
-        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 摄像头未开启", None
+        gallery = _build_gallery()
+        return gallery, _enroll_status(), "⚠️ 摄像头未开启", None
 
     img_bgr = cv2.cvtColor(np.array(webcam_img), cv2.COLOR_RGB2BGR)
     rect = detect_face(img_bgr)
     if rect is None:
-        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
-        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 未检测到人脸，请正对摄像头", None
+        gallery = _build_gallery()
+        return gallery, _enroll_status(), "⚠️ 未检测到人脸，请正对摄像头", None
 
     if len(_enroll_buffer) >= 20:
-        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
-        return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", "⚠️ 已达最大采集数量 (20张)", None
+        gallery = _build_gallery()
+        return gallery, _enroll_status(), "⚠️ 已达最大采集数量 (20张)", None
 
     _enroll_buffer.append(img_bgr)
-    gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
-    return gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
+    gallery = _build_gallery()
+    return gallery, _enroll_status(), f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
 
 
 def clear_enroll():
@@ -443,8 +453,8 @@ def batch_import_files(files):
     """批量导入文件: 自动检测人脸 → 入缓冲区, 选完即处理"""
     global _enroll_buffer
     if files is None or len(files) == 0:
-        gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
-        return (gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张",
+        gallery = _build_gallery()
+        return (gallery, _enroll_status(),
                 "⚠️ 未选择任何文件", None)
 
     total = len(files)
@@ -466,7 +476,7 @@ def batch_import_files(files):
         _enroll_buffer.append(img_bgr)
         added += 1
 
-    gallery = [_annotate_for_gallery(img) for img in _enroll_buffer]
+    gallery = _build_gallery()
     parts = []
     if added > 0:
         parts.append(f"✅ 已添加 **{added}** 张人脸")
@@ -476,7 +486,7 @@ def batch_import_files(files):
         parts.append(f"⏭️ {skipped_full} 张因缓冲区已满跳过")
     status = f"📁 从 {total} 个文件中: " + (", ".join(parts) if parts else "无有效图片")
 
-    return (gallery, f"已采集: **{len(_enroll_buffer)}** / 20 张", status, None)
+    return (gallery, _enroll_status(), status, None)
 
 
 def do_enroll(name):
@@ -604,8 +614,9 @@ def show_tsne():
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = plt.cm.get_cmap('tab10', len(label_names))
     for i, name in enumerate(label_names):
-        ax.scatter(X_tsne[y_all==i, 0], X_tsne[y_all==i, 1],
-                   c=[cmap(i)], label=f"{name} ({np.sum(y_all==i)})",
+        mask = y_all == i
+        ax.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                   c=[cmap(i)], label=f"{name} ({np.sum(mask)})",
                    alpha=0.6, s=15, edgecolors='none')
     ax.set_title('t-SNE 特征分布 (dlib 128维)')
     ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=7)
@@ -616,7 +627,8 @@ def show_clusters():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     cmap = plt.cm.get_cmap('tab10', len(label_names))
     for i, name in enumerate(label_names):
-        ax1.scatter(X_tsne[y_all==i, 0], X_tsne[y_all==i, 1],
+        mask = y_all == i
+        ax1.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
                     c=[cmap(i)], label=name, alpha=0.5, s=12, edgecolors='none')
     ax1.set_title('真实标签'); ax1.legend(bbox_to_anchor=(1.02,1), loc='upper left', fontsize=7)
     nc = len(set(km_labels)); cl_cmap = plt.cm.get_cmap('Set3', nc)
@@ -682,7 +694,7 @@ def build_ui():
                         out_detail = gr.Markdown("### 三模型预测详情")
                     with gr.Column():
                         top3_radio = gr.Radio(
-                            choices=["余弦匹配", "KNN(k=3)", "SVM(RBF)"],
+                            choices=_MODEL_CHOICES,
                             value="余弦匹配", label="Top-3 模型切换", interactive=True)
                         out_chart = gr.Image(label="Top-3 图表", type="pil")
 
@@ -714,7 +726,7 @@ def build_ui():
                         webcam_detail = gr.Markdown("")
                     with gr.Column():
                         webcam_top3_radio = gr.Radio(
-                            choices=["余弦匹配", "KNN(k=3)", "SVM(RBF)"],
+                            choices=_MODEL_CHOICES,
                             value="余弦匹配", label="Top-3 切换", interactive=True)
                         webcam_chart = gr.Image(label="Top-3 图表", type="pil")
 
@@ -858,12 +870,13 @@ def get_model_info():
 def get_stats():
     lines = ["| 类别 | 原始图片 | 增强后 |",
              "|------|----------|--------|"]
+    label_names_list = list(label_names)
     for cls in get_class_names():
         d = os.path.join(IMAGES_DIR, cls)
         if not os.path.isdir(d): continue
         raw = len([f for f in os.listdir(d)
-                   if f.lower().endswith(('.jpg','.jpeg','.png','.bmp','.webp'))])
-        aug = int(np.sum(y_all == list(label_names).index(cls))) if cls in label_names else 0
+                   if f.lower().endswith(_IMAGE_EXTENSIONS)])
+        aug = int(np.sum(y_all == label_names_list.index(cls))) if cls in label_names_list else 0
         lines.append(f"| {cls} | {raw} | {aug} |")
     return "\n".join(lines)
 
