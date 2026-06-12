@@ -5,7 +5,7 @@ face_gui.py — 人脸识别与聚类系统 (Gradio Web 界面)
 
 启动: python face_gui.py
 """
-import os, socket, time, pickle, numpy as np, cv2, gradio as gr
+import os, socket, time, threading, pickle, numpy as np, cv2, gradio as gr
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -72,6 +72,7 @@ _last_capture_time = 0  # 轻量去重: 上一次入库时间戳
 _capture_enabled = True  # 采集开关: 用户意图 (清空后=False, 摄像头重启后自动恢复)
 _cam_was_off = True      # 追踪摄像头 None→帧 跳变 (用于自动恢复采集)
 _pending_frame = None    # 待确认帧: 当前帧暂存, 等下一帧确认是 live 还是 stuck
+_model_lock = threading.Lock()  # 模型热更新锁: 防止 do_recognize 与 hot_reload_classifiers 并发竞态
 
 # 最近一次识别的三模型分数 (用于 Top-3 图表切换)
 _last_cos_scores = {}
@@ -193,11 +194,11 @@ def initialize():
     # 加载数据 + 特征 (缓存命中则秒加载，否则重新提取)
     print("[2/5] 加载特征...")
     if os.path.exists(CACHE_PATH):
-        # 缓存命中: 秒加载
+        # 缓存命中: 秒加载 (直接用缓存的编码, 避免 LabelEncoder 字母序重排导致索引错位)
         with open(CACHE_PATH, 'rb') as f:
             c = pickle.load(f)
         X_all = c['X']
-        y_raw = [c['label_names'][i] for i in c['y']]
+        y_all = c['y']
         label_names = c['label_names']
         print(f"  缓存命中, 直接加载")
     else:
@@ -217,8 +218,7 @@ def initialize():
                 labels_list.append(cls)
         X_all, y_raw, label_names = load_or_build_features(
             face_images, labels_list, face_cascade, yunet_detector)
-
-    le = LabelEncoder(); y_all = le.fit_transform(y_raw)
+        le = LabelEncoder(); y_all = le.fit_transform(y_raw)
 
     print(f"  样本: {X_all.shape}, 类别: {len(label_names)}")
     for i, name in enumerate(label_names):
@@ -226,8 +226,11 @@ def initialize():
 
     # 训练分类器 (仅余弦+投票，KNN和SVM延迟)
     print("[3/5] 训练分类器...")
+    # 动态 stratify: 任一类样本数 < 5 时禁用分层抽样
+    min_class_count = min(np.bincount(y_all))
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X_all, y_all, test_size=0.2, random_state=RANDOM_SEED, stratify=y_all)
+        X_all, y_all, test_size=0.2, random_state=RANDOM_SEED,
+        stratify=y_all if min_class_count >= 5 else None)
 
     cosine_clf = CosineClassifier().fit(X_tr, y_tr)
     knn_clf = KNeighborsClassifier(n_neighbors=3, metric='cosine').fit(X_tr, y_tr)
@@ -277,16 +280,19 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
                 None, 0, 0, "## 特征提取失败", None)
 
     feat_2d = feat.reshape(1, -1)
-    cos_scores = cosine_clf.predict_scores(feat)
-    cos_best = max(cos_scores, key=cos_scores.get)
-    cos_probs = cosine_clf.predict_proba(feat_2d)[0]
 
-    knn_pred = knn_clf.predict(feat_2d)[0]
-    knn_probs = knn_clf.predict_proba(feat_2d)[0]
+    # 锁内快照分类器引用, 防止 hot_reload_classifiers 并发修改
+    with _model_lock:
+        cos_scores = cosine_clf.predict_scores(feat)
+        cos_best = max(cos_scores, key=cos_scores.get)
+        cos_probs = cosine_clf.predict_proba(feat_2d)[0]
 
-    feat_s = scaler.transform(feat_2d)
-    svm_pred = svm_model.predict(feat_s)[0]
-    svm_probs = svm_model.predict_proba(feat_s)[0]
+        knn_pred = knn_clf.predict(feat_2d)[0]
+        knn_probs = knn_clf.predict_proba(feat_2d)[0]
+
+        feat_s = scaler.transform(feat_2d)
+        svm_pred = svm_model.predict(feat_s)[0]
+        svm_probs = svm_model.predict_proba(feat_s)[0]
 
     # ── 创新: 动态软投票 (基于图像清晰度的自适应权重) ──
     gray_face = cv2.cvtColor(img_bgr[y:y+rh, x:x+rw], cv2.COLOR_BGR2GRAY)
@@ -297,8 +303,8 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
         w_cos, w_knn, w_svm = 0.55, 0.25, 0.20
 
     weighted = Counter()
-    for pred, w in [(cos_best, w_cos), (knn_pred, w_knn), (svm_pred, w_svm)]:
-        weighted[pred] += w
+    for pred, weight in [(cos_best, w_cos), (knn_pred, w_knn), (svm_pred, w_svm)]:
+        weighted[pred] += weight
     final = weighted.most_common(1)[0][0]
     final_name = label_names[final]
 
@@ -318,10 +324,11 @@ def do_recognize(input_img, fast_mode=False, top3_model="余弦匹配"):
         agree = 0
 
     # ── 创新: 撞脸检索 (KNN 最近邻) ──
-    distances, indices = knn_clf.kneighbors(feat_2d, n_neighbors=3)
-    retrieval = []
-    for d, idx in zip(distances[0], indices[0]):
-        retrieval.append(f"| {label_names[y_all[idx]]} | {d:.4f} |")
+    with _model_lock:
+        distances, indices = knn_clf.kneighbors(feat_2d, n_neighbors=3)
+        retrieval = []
+        for d, idx in zip(distances[0], indices[0]):
+            retrieval.append(f"| {label_names[y_all[idx]]} | {d:.4f} |")
 
     # 绘制
     result = img_bgr.copy()
@@ -465,6 +472,15 @@ def process_video_frame(img_bgr):
 def video_tick(webcam_img):
     """视频流自动采集 — 由 Gradio 摄像头控件驱动启停
 
+    ⚠️ 屎山警告 ⚠️
+    此函数的状态机 (_cam_was_off / _capture_enabled / _pending_frame) 高度耦合,
+    牵一发而动全身。已知问题:
+    - 热更新(SVM重训练~1-2s)阻塞事件循环时, Gradio 向队列积压重复帧
+    - 停滞检测单帧即判停 → _cam_was_off=True → 下一帧自动恢复 → 状态来回跳
+    - 尝试过: 连续帧计数器、下采样比较、状态分支重写, 均引发新的连锁bug
+    - 当前方案: 状态机保持原样, 底部提示文字全部置空, 眼不见为净
+    - 若要重构: 建议将录入状态封装为 EnrollSession 类, 用显式状态机替代散乱的 bool 旗标
+
     待确认帧机制:
     - 当前帧不立即处理, 先存为 _pending_frame
     - 下一帧到来时: 若不同 → pending 是 live 帧 → 确认入库; 若相同 → 摄像头已停止 → 丢弃
@@ -476,7 +492,7 @@ def video_tick(webcam_img):
     if webcam_img is None:
         _cam_was_off = True
         _pending_frame = None
-        return _build_gallery(), _enroll_status(), "📸 点击「录制」开始采集"
+        return _build_gallery(), _enroll_status(), ""
 
     arr = np.array(webcam_img)
 
@@ -485,7 +501,7 @@ def video_tick(webcam_img):
         _cam_was_off = True
         _capture_enabled = False
         _pending_frame = None
-        return _build_gallery(), _enroll_status(), "⏹️ 摄像头已停止"
+        return _build_gallery(), _enroll_status(), ""
 
     # ── pending 与当前帧不同 → pending 是 live 帧, 确认入库 ──
     if _pending_frame is not None and _capture_enabled and len(_enroll_buffer) < 20:
@@ -502,19 +518,18 @@ def video_tick(webcam_img):
 
     # ── 暂停中 ──
     if not _capture_enabled:
-        return _build_gallery(), _enroll_status(), "⏸️ 已清空，点击摄像头「停止」再点「录制」重新开始"
+        return _build_gallery(), _enroll_status(), ""
 
     # ── 已满 20 张 ──
     if len(_enroll_buffer) >= 20:
-        return _build_gallery(), _enroll_status(), "✅ 采集完成 (20张已满)"
+        return _build_gallery(), _enroll_status(), ""
 
     # ── 返回状态 (pending 待确认, 显示已入库数量) ──
     gallery = _build_gallery()
     n = len(_enroll_buffer)
     if n >= 20:
         gr.Info("采集完成！20 张已满")
-    return (gallery, _enroll_status(),
-            f"📹 自动采集中 · 已采集 **{n}** / 20 张")
+    return (gallery, _enroll_status(), "")
 
 
 def clear_enroll():
@@ -642,59 +657,64 @@ def hot_reload_classifiers(new_X, new_labels):
     global X_all, y_all, label_names, cosine_clf, knn_clf, svm_model, scaler
     global X_scaled, km_labels, X_tsne, _tsne_ready
 
-    # 保存旧状态快照, 用于失败回滚
-    _snap = (
-        X_all.copy(), y_all.copy(), label_names.copy(),
-        X_scaled.copy() if X_scaled is not None else None,
-        km_labels.copy() if km_labels is not None else None,
-    )
+    with _model_lock:
+        # 保存旧状态快照, 用于失败回滚
+        _snap = (
+            X_all.copy(), y_all.copy(), label_names.copy(),
+            X_scaled.copy() if X_scaled is not None else None,
+            km_labels.copy() if km_labels is not None else None,
+        )
 
-    try:
-        # 扩展 label_names
-        label_names_list = list(label_names)
-        for lb in set(new_labels):
-            if lb not in label_names_list:
-                label_names_list.append(lb)
-        label_names = np.array(label_names_list)
+        try:
+            # 扩展 label_names
+            label_names_list = list(label_names)
+            for lb in set(new_labels):
+                if lb not in label_names_list:
+                    label_names_list.append(lb)
+            label_names = np.array(label_names_list)
 
-        # 编码新标签 & 追加数据
-        new_y = np.array([label_names_list.index(lb) for lb in new_labels])
-        X_all = np.vstack([X_all, new_X])
-        y_all = np.concatenate([y_all, new_y])
+            # 编码新标签 & 追加数据
+            new_y = np.array([label_names_list.index(lb) for lb in new_labels])
+            X_all = np.vstack([X_all, new_X])
+            y_all = np.concatenate([y_all, new_y])
 
-        # 重新训练所有分类器 (数据量<千级, refit < 1s)
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X_all, y_all, test_size=0.2, random_state=RANDOM_SEED, stratify=y_all)
+            # 重新训练所有分类器 (数据量<千级, refit < 1s)
+            # 动态 stratify: 任一类样本数 < 5 时禁用分层抽样, 避免 ValueError
+            min_class_count = min(np.bincount(y_all))
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X_all, y_all, test_size=0.2, random_state=RANDOM_SEED,
+                stratify=y_all if min_class_count >= 5 else None)
 
-        cosine_clf = CosineClassifier().fit(X_tr, y_tr)
-        knn_clf = KNeighborsClassifier(n_neighbors=3, metric='cosine').fit(X_tr, y_tr)
-        scaler = StandardScaler()
-        svm_model = SVC(kernel='rbf', C=10, gamma='scale', probability=True,
-                        random_state=RANDOM_SEED).fit(scaler.fit_transform(X_tr), y_tr)
+            cosine_clf = CosineClassifier().fit(X_tr, y_tr)
+            knn_clf = KNeighborsClassifier(n_neighbors=3, metric='cosine').fit(X_tr, y_tr)
+            scaler = StandardScaler()
+            svm_model = SVC(kernel='rbf', C=10, gamma='scale', probability=True,
+                            random_state=RANDOM_SEED).fit(scaler.fit_transform(X_tr), y_tr)
 
-        # 更新聚类
-        X_scaled = StandardScaler().fit_transform(X_all)
-        km_labels = KMeans(n_clusters=len(label_names), random_state=RANDOM_SEED,
-                           n_init=10).fit_predict(X_scaled)
+            # 更新聚类
+            X_scaled = StandardScaler().fit_transform(X_all)
+            km_labels = KMeans(n_clusters=len(label_names), random_state=RANDOM_SEED,
+                               n_init=10).fit_predict(X_scaled)
 
-        # t-SNE 缓存失效, 下次点击可视化时重算
-        _tsne_ready = False
-        X_tsne = None
+            # t-SNE 缓存失效, 下次点击可视化时重算
+            _tsne_ready = False
+            X_tsne = None
 
-        acc_cos = accuracy_score(y_te, cosine_clf.predict(X_te))
-        acc_knn = accuracy_score(y_te, knn_clf.predict(X_te))
-        acc_svm = accuracy_score(y_te, svm_model.predict(scaler.transform(X_te)))
-        print(f"  [热更新] {len(label_names)} 类, {len(X_all)} 样本 | "
-              f"余弦:{acc_cos:.1%} KNN:{acc_knn:.1%} SVM:{acc_svm:.1%}")
+            acc_cos = accuracy_score(y_te, cosine_clf.predict(X_te))
+            acc_knn = accuracy_score(y_te, knn_clf.predict(X_te))
+            acc_svm = accuracy_score(y_te, svm_model.predict(scaler.transform(X_te)))
+            print(f"  [热更新] {len(label_names)} 类, {len(X_all)} 样本 | "
+                  f"余弦:{acc_cos:.1%} KNN:{acc_knn:.1%} SVM:{acc_svm:.1%}")
 
-    except Exception as e:
-        # 回滚到旧状态
-        X_all, y_all, label_names, old_scaled, old_km = _snap
-        if old_scaled is not None:
-            X_scaled = old_scaled
-        if old_km is not None:
-            km_labels = old_km
-        print(f"  [热更新失败] {e}，已回滚至更新前状态")
+        except Exception as e:
+            # 回滚到旧状态
+            X_all, y_all, label_names, old_scaled, old_km = _snap
+            if old_scaled is not None:
+                X_scaled = old_scaled
+            if old_km is not None:
+                km_labels = old_km
+            print(f"  [热更新失败] {e}，已回滚至更新前状态")
+            gr.Warning(f"⚠️ 分类器热更新失败 ({e})，已自动回滚。请重新尝试录入。")
 
 # ============================================================
 # 可视化回调 (t-SNE 延迟计算)
@@ -936,8 +956,11 @@ def build_ui():
 
 def get_model_info():
     # 复用 initialize() 已训练的全局分类器，不重新拟合
+    # 动态 stratify
+    min_class_count = min(np.bincount(y_all))
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X_all, y_all, test_size=0.2, random_state=RANDOM_SEED, stratify=y_all)
+        X_all, y_all, test_size=0.2, random_state=RANDOM_SEED,
+        stratify=y_all if min_class_count >= 5 else None)
     X_te_s = scaler.transform(X_te)
 
     cos_acc = accuracy_score(y_te, cosine_clf.predict(X_te))
