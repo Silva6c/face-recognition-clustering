@@ -38,10 +38,11 @@ YUNET_CONF_THRESHOLD = 0.6
 # 图片读取
 # ============================================================
 def imread_safe(path):
-    """兼容中文路径"""
-    img = cv2.imread(path)
-    if img is not None:
-        return img
+    """兼容中文路径：非 ASCII 路径跳过 cv2.imread，直接用 numpy 读取避免控制台警告"""
+    if all(ord(c) < 128 for c in path):
+        img = cv2.imread(path)
+        if img is not None:
+            return img
     with open(path, 'rb') as f:
         return cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
 

@@ -66,6 +66,12 @@ _IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
 _MODEL_CHOICES = ["余弦匹配", "KNN(k=3)", "SVM(RBF)"]
 
 _enroll_buffer = []  # 录入采集缓冲区: list of BGR numpy arrays
+_enroll_gallery_cache = []  # Gallery 标注缓存 (增量标注, 避免每帧重复计算)
+_last_face_rect = None  # 轻量去重: 上一次入库的人脸 bbox
+_last_capture_time = 0  # 轻量去重: 上一次入库时间戳
+_capture_enabled = True  # 采集开关: 用户意图 (清空后=False, 摄像头重启后自动恢复)
+_cam_was_off = True      # 追踪摄像头 None→帧 跳变 (用于自动恢复采集)
+_pending_frame = None    # 待确认帧: 当前帧暂存, 等下一帧确认是 live 还是 stuck
 
 # 最近一次识别的三模型分数 (用于 Top-3 图表切换)
 _last_cos_scores = {}
@@ -405,7 +411,11 @@ def set_webcam_top3(choice):
 # 在线录入回调
 # ============================================================
 def _build_gallery():
-    return [_annotate_for_gallery(img) for img in _enroll_buffer]
+    """增量构建 Gallery — 仅标注新增图片, 已标注的直接复用缓存"""
+    while len(_enroll_gallery_cache) < len(_enroll_buffer):
+        idx = len(_enroll_gallery_cache)
+        _enroll_gallery_cache.append(_annotate_for_gallery(_enroll_buffer[idx]))
+    return list(_enroll_gallery_cache)
 
 def _enroll_status():
     return f"已采集: **{len(_enroll_buffer)}** / 20 张"
@@ -420,38 +430,106 @@ def _annotate_for_gallery(img_bgr):
     return cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
 
 
-def capture_face(webcam_img):
-    """从摄像头采集一张人脸照片"""
-    global _enroll_buffer
-    if webcam_img is None:
-        gallery = _build_gallery()
-        gr.Warning("摄像头未开启")
-        return gallery, _enroll_status(), "⚠️ 摄像头未开启", gr.skip()
-
-    img_bgr = cv2.cvtColor(np.array(webcam_img), cv2.COLOR_RGB2BGR)
-    rect = detect_face(img_bgr)
-    if rect is None:
-        gallery = _build_gallery()
-        gr.Warning("未检测到人脸，请正对摄像头")
-        return gallery, _enroll_status(), "⚠️ 未检测到人脸，请正对摄像头", gr.skip()
-
+def process_video_frame(img_bgr):
+    """视频流帧处理：人脸检测 → 质量检查 → 去重 → 入库
+    返回 (ok, reason): ok=True 表示已入库，reason 为 "full"/"no_face"/"blurry"/"duplicate"/"ok"
+    """
+    global _enroll_buffer, _last_face_rect, _last_capture_time
     if len(_enroll_buffer) >= 20:
-        gallery = _build_gallery()
-        gr.Warning("已达最大采集数量 20 张")
-        return gallery, _enroll_status(), "⚠️ 已达最大采集数量 (20张)", gr.skip()
-
+        return False, "full"
+    rect = detect_face(img_bgr, fast_mode=True)
+    if rect is None:
+        return False, "no_face"
+    x, y, w, h = rect
+    # 清晰度检查 (仅人脸区域, 更快)
+    face_gray = cv2.cvtColor(img_bgr[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+    blur = cv2.Laplacian(face_gray, cv2.CV_64F).var()
+    if blur < 80:
+        return False, "blurry"
+    # 轻量去重: bbox 中心位移 + 最小时间间隔 (替代 dlib 嵌入, 提速 ~30x)
+    now = time.time()
+    if _last_face_rect is not None:
+        lx, ly, lw, lh = _last_face_rect
+        cx_shift = abs((x + w/2) - (lx + lw/2)) / max(w, lw, 1)
+        cy_shift = abs((y + h/2) - (ly + lh/2)) / max(h, lh, 1)
+        elapsed = now - _last_capture_time
+        # 脸没怎么动 + 间隔不够 → 跳过 (鼓励用户转头换角度)
+        if cx_shift < 0.15 and cy_shift < 0.15 and elapsed < 0.8:
+            return False, "duplicate"
+    _last_face_rect = rect
+    _last_capture_time = now
     _enroll_buffer.append(img_bgr)
+    return True, "ok"
+
+
+def video_tick(webcam_img):
+    """视频流自动采集 — 由 Gradio 摄像头控件驱动启停
+
+    待确认帧机制:
+    - 当前帧不立即处理, 先存为 _pending_frame
+    - 下一帧到来时: 若不同 → pending 是 live 帧 → 确认入库; 若相同 → 摄像头已停止 → 丢弃
+    - 根除"停止后多入库1张"的结构性缺陷 (停滞检测与比较基准永远滞后1帧)
+    """
+    global _capture_enabled, _cam_was_off, _pending_frame
+
+    # ── 摄像头未开 (Gradio 发送 None) ──
+    if webcam_img is None:
+        _cam_was_off = True
+        _pending_frame = None
+        return _build_gallery(), _enroll_status(), "📸 点击「录制」开始采集"
+
+    arr = np.array(webcam_img)
+
+    # ── 停滞检测: pending 与当前帧相同 → 摄像头已停止, 丢弃 pending ──
+    if _pending_frame is not None and np.array_equal(arr, _pending_frame):
+        _cam_was_off = True
+        _capture_enabled = False
+        _pending_frame = None
+        return _build_gallery(), _enroll_status(), "⏹️ 摄像头已停止"
+
+    # ── pending 与当前帧不同 → pending 是 live 帧, 确认入库 ──
+    if _pending_frame is not None and _capture_enabled and len(_enroll_buffer) < 20:
+        img_bgr = cv2.cvtColor(_pending_frame, cv2.COLOR_RGB2BGR)
+        process_video_frame(img_bgr)
+
+    # ── 当前帧变为新的 pending ──
+    _pending_frame = arr.copy()
+
+    # ── 摄像头刚启动 → 自动恢复采集 ──
+    if _cam_was_off:
+        _cam_was_off = False
+        _capture_enabled = True
+
+    # ── 暂停中 ──
+    if not _capture_enabled:
+        return _build_gallery(), _enroll_status(), "⏸️ 已清空，点击摄像头「停止」再点「录制」重新开始"
+
+    # ── 已满 20 张 ──
+    if len(_enroll_buffer) >= 20:
+        return _build_gallery(), _enroll_status(), "✅ 采集完成 (20张已满)"
+
+    # ── 返回状态 (pending 待确认, 显示已入库数量) ──
     gallery = _build_gallery()
-    gr.Info(f"第 {len(_enroll_buffer)} 张采集成功")
-    return gallery, _enroll_status(), f"✅ 第 {len(_enroll_buffer)} 张采集成功", None
+    n = len(_enroll_buffer)
+    if n >= 20:
+        gr.Info("采集完成！20 张已满")
+    return (gallery, _enroll_status(),
+            f"📹 自动采集中 · 已采集 **{n}** / 20 张")
 
 
 def clear_enroll():
-    """清空采集缓冲区 + 所有输入组件"""
-    global _enroll_buffer
+    """清空采集缓冲区并暂停采集, 需重启摄像头恢复"""
+    global _enroll_buffer, _enroll_gallery_cache
+    global _last_face_rect, _last_capture_time
+    global _capture_enabled, _pending_frame
     _enroll_buffer = []
+    _enroll_gallery_cache = []
+    _last_face_rect = None
+    _last_capture_time = 0
+    _capture_enabled = False
+    _pending_frame = None
     gr.Info("已清空采集缓冲区")
-    return [], "已采集: **0** / 20 张", "🔄 已清空，请重新采集", None, None
+    return [], "已采集: **0** / 20 张", "⏸️ 已清空，点击摄像头「停止」再点「录制」重新开始", None
 
 
 def batch_import_files(files):
@@ -505,7 +583,7 @@ def batch_import_files(files):
 
 def do_enroll(name):
     """确认录入新面孔 — 提取特征 + 热更新分类器"""
-    global _enroll_buffer
+    global _enroll_buffer, _enroll_gallery_cache, _last_face_rect, _last_capture_time
 
     if not name or not name.strip():
         gallery = _build_gallery()
@@ -538,6 +616,9 @@ def do_enroll(name):
     n_features = len(new_X)
     n_raw = len(images_bgr)
     _enroll_buffer = []
+    _enroll_gallery_cache = []
+    _last_face_rect = None
+    _last_capture_time = 0
 
     gr.Info(f"✅ {name} 录入成功！")
     return (
@@ -775,7 +856,6 @@ def build_ui():
                                               sources=["webcam"], streaming=True,
                                               height=300)
                         with gr.Row():
-                            btn_capture = gr.Button("📸 采集一张", variant="primary")
                             btn_clear_enroll = gr.Button("🔄 清空重来")
                         enroll_count = gr.Markdown("已采集: **0** / 20 张")
                     with gr.Column(scale=3):
@@ -800,15 +880,16 @@ def build_ui():
 
                 enroll_status = gr.Markdown("等待采集...")
 
-                # 单张采集 — streaming=True 保持摄像头流
-                btn_capture.click(
-                    fn=capture_face, inputs=[enroll_cam],
-                    outputs=[enroll_gallery, enroll_count, enroll_status, enroll_cam])
+                # 视频流自动采集 — Timer 驱动，读 enroll_cam 不写它
+                video_timer = gr.Timer(0.3)
+                video_timer.tick(fn=video_tick, inputs=[enroll_cam],
+                                 outputs=[enroll_gallery, enroll_count, enroll_status])
+
                 # 清空全部 (缓冲区 + 摄像头 + 文件选择)
                 btn_clear_enroll.click(
                     fn=clear_enroll,
                     outputs=[enroll_gallery, enroll_count, enroll_status,
-                             enroll_cam, batch_files])
+                             batch_files])
                 # 批量文件导入 → 选完自动处理
                 batch_files.upload(
                     fn=batch_import_files, inputs=[batch_files],
@@ -820,7 +901,7 @@ def build_ui():
 
                 gr.Markdown("""
                 > 💡 **两种录入方式**:
-                > 1. 📸 **摄像头**: 开启摄像头 → 点击「采集一张」(自动清除预览，可连续采集)
+                > 1. 📹 **录制采集**: 点击「录制」→ 自动抽帧入库 →「停止」结束；🔄 清空重来会暂停采集，需重新开关摄像头恢复
                 > 2. 📁 **批量导入**: 选择多个文件 → 自动检测人脸并添加 (无需额外点击)
                 > 录入后三个分类器（余弦/KNN/SVM）同步热更新，立即生效。
                 """)
