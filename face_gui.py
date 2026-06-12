@@ -461,7 +461,7 @@ def process_video_frame(img_bgr):
         cy_shift = abs((y + h/2) - (ly + lh/2)) / max(h, lh, 1)
         elapsed = now - _last_capture_time
         # 脸没怎么动 + 间隔不够 → 跳过 (鼓励用户转头换角度)
-        if cx_shift < 0.15 and cy_shift < 0.15 and elapsed < 0.8:
+        if cx_shift < 0.06 and cy_shift < 0.06 and elapsed < 0.4:
             return False, "duplicate"
     _last_face_rect = rect
     _last_capture_time = now
@@ -487,7 +487,6 @@ def video_tick(webcam_img):
     - 根除"停止后多入库1张"的结构性缺陷 (停滞检测与比较基准永远滞后1帧)
     """
     global _capture_enabled, _cam_was_off, _pending_frame
-
     # ── 摄像头未开 (Gradio 发送 None) ──
     if webcam_img is None:
         _cam_was_off = True
@@ -497,7 +496,7 @@ def video_tick(webcam_img):
     arr = np.array(webcam_img)
 
     # ── 停滞检测: pending 与当前帧相同 → 摄像头已停止, 丢弃 pending ──
-    if _pending_frame is not None and np.array_equal(arr, _pending_frame):
+    if _pending_frame is not None and np.array_equal(arr[::8, ::8], _pending_frame[::8, ::8]):
         _cam_was_off = True
         _capture_enabled = False
         _pending_frame = None
@@ -507,6 +506,8 @@ def video_tick(webcam_img):
     if _pending_frame is not None and _capture_enabled and len(_enroll_buffer) < 20:
         img_bgr = cv2.cvtColor(_pending_frame, cv2.COLOR_RGB2BGR)
         process_video_frame(img_bgr)
+        if len(_enroll_buffer) >= 20:
+            gr.Info("采集完成！20 张已满")
 
     # ── 当前帧变为新的 pending ──
     _pending_frame = arr.copy()
@@ -522,7 +523,7 @@ def video_tick(webcam_img):
 
     # ── 已满 20 张 ──
     if len(_enroll_buffer) >= 20:
-        return _build_gallery(), _enroll_status(), ""
+        return _build_gallery(), _enroll_status(), "✅ 采集完成 (20张已满)"
 
     # ── 返回状态 (pending 待确认, 显示已入库数量) ──
     gallery = _build_gallery()
@@ -598,8 +599,7 @@ def batch_import_files(files):
 
 def do_enroll(name):
     """确认录入新面孔 — 提取特征 + 热更新分类器"""
-    global _enroll_buffer, _enroll_gallery_cache, _last_face_rect, _last_capture_time
-
+    global _enroll_buffer, _enroll_gallery_cache, _last_face_rect, _last_capture_time 
     if not name or not name.strip():
         gallery = _build_gallery()
         gr.Warning("请先输入姓名")
